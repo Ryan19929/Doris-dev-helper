@@ -47,7 +47,8 @@ esac
 
 # Parse parameters
 MULTI_CLUSTERS_SPEC=""
-while getopts "v:c:f:b:m:xXN:S:h" opt; do
+SINGLE_CLUSTER_NAME=""
+while getopts "v:c:f:b:m:n:xXN:S:h" opt; do
   case $opt in
     v)
       DORIS_QUICK_START_VERSION="$OPTARG"
@@ -70,6 +71,9 @@ while getopts "v:c:f:b:m:xXN:S:h" opt; do
       ;;
     m)
       MULTI_CLUSTERS_SPEC="$OPTARG"
+      ;;
+    n)
+      SINGLE_CLUSTER_NAME="$OPTARG"
       ;;
     x)
       USE_SHARED_NET=true
@@ -106,6 +110,7 @@ Options:
   -c <custom_version>      Use custom images doris.fe:<ver> and doris.be:<ver> (e.g. -c 3.0.6)
   -f <num>                 Number of FE instances (single-cluster mode; default: 1)
   -b <num>                 Number of BE instances (single-cluster mode; default: 1)
+  -n <name>                Single-cluster mode with custom name (allows multiple named clusters)
   -m <spec>                Multi-cluster mode. Examples:
                            -m 'cluster1=1fe3be,cluster2=1fe1be'
                            -m '1fe3be,1fe1be' (auto-named: cluster1, cluster2)
@@ -118,17 +123,26 @@ Options:
 
 Notes:
   - Each cluster uses its own compose file: docker-compose-doris-<name>.yaml and project name '-p <name>'
-  - Subnets per cluster: 172.20.90.0/24, 172.20.91.0/24, ... in order
+  - Subnets auto-allocated to avoid conflicts: 172.20.90.0/24, 172.20.91.0/24, ... (or 172.30.90.0/24, 172.30.91.0/24, ... for shared networks)
+  - Named single clusters (-n) also get unique subnets automatically
   - FE1 IP: <SUBNET_BASE>.2, BE1 IP: <SUBNET_BASE>.(fe_n+2)
 
 Examples:
   # Start single cluster with custom images
   ./start-doris.sh -c 3-local -f 1 -b 3
 
-  # Start two clusters
+  # Start named single cluster
+  ./start-doris.sh -c 3-local -f 1 -b 3 -n mycluster
+
+  # Start multiple named single clusters
+  ./start-doris.sh -c 3-local -f 1 -b 2 -n cluster1
+  ./start-doris.sh -c 3-local -f 1 -b 3 -n cluster2
+
+  # Start two clusters (multi-cluster mode)
   ./start-doris.sh -c 3-local -m 'cluster1=1fe3be,cluster2=1fe1be'
 
   # Stop specific clusters
+  ./start-doris.sh stop -n mycluster
   ./start-doris.sh stop -m 'cluster1,cluster2'
 EOF
   exit 0
@@ -185,13 +199,23 @@ if [[ "$ACTION" == "stop" ]]; then
       fi
     done
     exit 0
+  elif [[ -n "$SINGLE_CLUSTER_NAME" ]]; then
+    compose_file="docker-compose-doris-${SINGLE_CLUSTER_NAME}.yaml"
+    if [[ -f "$compose_file" ]]; then
+      $COMPOSE_CMD -p "$SINGLE_CLUSTER_NAME" -f "$compose_file" down
+      echo "Doris cluster '$SINGLE_CLUSTER_NAME' stopped."
+      exit 0
+    else
+      echo "Error: $compose_file not found in $(pwd)."
+      exit 1
+    fi
   else
     if [[ -f docker-compose-doris.yaml ]]; then
       $COMPOSE_CMD -f docker-compose-doris.yaml down
       echo "Doris cluster stopped."
       exit 0
     else
-      echo "Error: docker-compose-doris.yaml not found in $(pwd). Use -m to stop specific clusters."
+      echo "Error: docker-compose-doris.yaml not found in $(pwd). Use -n or -m to stop specific clusters."
       exit 1
     fi
   fi
@@ -296,9 +320,11 @@ if [[ -n "$MULTI_CLUSTERS_SPEC" ]]; then
       for (( i=1; i<=fe_n; i++ )); do
         fe_ip_octet=$((1 + i))
         fe_ip="${SUBNET_BASE}.${fe_ip_octet}"
-        echo "  fe${i}:"
+        fe_container_name=$(get_container_name "fe${i}" "$name")
+        echo "  ${fe_container_name}:"
         echo "    image: ${FE_IMAGE}"
         echo "    hostname: fe${i}"
+        echo "    container_name: ${fe_container_name}"
         if [[ "$i" -eq 1 ]]; then
           expose_8030=true; expose_9030=true; expose_9010=true
           command -v ss &>/dev/null && {
@@ -332,9 +358,11 @@ if [[ -n "$MULTI_CLUSTERS_SPEC" ]]; then
       for (( j=1; j<=be_n; j++ )); do
         be_ip_octet=$((1 + fe_n + j))
         be_ip="${SUBNET_BASE}.${be_ip_octet}"
-        echo "  be${j}:"
+        be_container_name=$(get_container_name "be${j}" "$name")
+        echo "  ${be_container_name}:"
         echo "    image: ${BE_IMAGE}"
         echo "    hostname: be${j}"
+        echo "    container_name: ${be_container_name}"
         if [[ "$j" -eq 1 ]]; then
           expose_8040=true; expose_9050=true
           command -v ss &>/dev/null && {
@@ -388,14 +416,72 @@ if [[ -n "$MULTI_CLUSTERS_SPEC" ]]; then
   done
 else
   # Single cluster path (backward compatible)
-  # Generate docker-compose configuration
-  if [[ "$USE_SINGLE_SHARED_NET" == "true" ]]; then
-    SUBNET_BASE="${SHARED_BASE_PREFIX}.90"
-    SUBNET_CIDR="${SUBNET_BASE}.0/24"
+  # Determine cluster name and file names
+  if [[ -n "$SINGLE_CLUSTER_NAME" ]]; then
+    cluster_name="$SINGLE_CLUSTER_NAME"
+    compose_file="docker-compose-doris-${cluster_name}.yaml"
   else
-    SUBNET_BASE="172.20.90"
-    SUBNET_CIDR="${SUBNET_BASE}.0/24"
+    cluster_name=""
+    compose_file="docker-compose-doris.yaml"
   fi
+  
+  # Function to find next available subnet
+  find_next_subnet() {
+    local base_prefix="$1"
+    local start_octet=90
+    
+    # For named clusters, find next available subnet to avoid conflicts
+    if [[ -n "$cluster_name" ]]; then
+      local third_octet=$start_octet
+      while true; do
+        local subnet_pattern="${base_prefix}\.${third_octet}\."
+        local subnet_in_use=false
+        
+        # Check all existing compose files for this subnet
+        for existing_compose in docker-compose-doris*.yaml; do
+          [[ -f "$existing_compose" ]] || continue
+          if grep -q "$subnet_pattern" "$existing_compose" 2>/dev/null; then
+            subnet_in_use=true
+            break
+          fi
+        done
+        
+        [[ "$subnet_in_use" == "false" ]] && break
+        ((third_octet++))
+        
+        # Safety check to prevent infinite loop
+        if [[ $third_octet -gt 200 ]]; then
+          echo "Warning: Too many clusters, using subnet ${base_prefix}.${third_octet}" >&2
+          break
+        fi
+      done
+      echo "${base_prefix}.${third_octet}"
+    else
+      echo "${base_prefix}.${start_octet}"
+    fi
+  }
+
+  # Function to generate container name with optional cluster prefix
+  get_container_name() {
+    local service_name="$1"
+    local cluster_name="$2"
+    if [[ -n "$cluster_name" ]]; then
+      echo "${cluster_name}-${service_name}"
+    else
+      echo "$service_name"
+    fi
+  }
+
+  # Generate docker-compose configuration with optimized network logic
+  base_prefix=""
+  if [[ "$USE_SINGLE_SHARED_NET" == "true" ]]; then
+    base_prefix="$SHARED_BASE_PREFIX"
+  else
+    base_prefix="172.20"
+  fi
+  
+  SUBNET_BASE=$(find_next_subnet "$base_prefix")
+  SUBNET_CIDR="${SUBNET_BASE}.0/24"
 
   FE_SERVERS_LIST=""
   for (( i=1; i<=FE_NUM; i++ )); do
@@ -431,9 +517,11 @@ else
     for (( i=1; i<=FE_NUM; i++ )); do
       fe_ip_octet=$((1 + i))
       fe_ip="${SUBNET_BASE}.${fe_ip_octet}"
-      echo "  fe${i}:"
+      fe_container_name=$(get_container_name "fe${i}" "$cluster_name")
+      echo "  ${fe_container_name}:"
       echo "    image: ${FE_IMAGE}"
       echo "    hostname: fe${i}"
+      echo "    container_name: ${fe_container_name}"
       if [[ "$i" -eq 1 ]]; then
         expose_8030=true; expose_9030=true; expose_9010=true
         command -v ss &>/dev/null && {
@@ -467,9 +555,11 @@ else
     for (( j=1; j<=BE_NUM; j++ )); do
       be_ip_octet=$((1 + FE_NUM + j))
       be_ip="${SUBNET_BASE}.${be_ip_octet}"
-      echo "  be${j}:"
+      be_container_name=$(get_container_name "be${j}" "$cluster_name")
+      echo "  ${be_container_name}:"
       echo "    image: ${BE_IMAGE}"
       echo "    hostname: be${j}"
+      echo "    container_name: ${be_container_name}"
       if [[ "$j" -eq 1 ]]; then
         expose_8040=true; expose_9050=true
         command -v ss &>/dev/null && {
@@ -499,9 +589,13 @@ else
         fi
       fi
     done
-  } > docker-compose-doris.yaml
+  } > "$compose_file"
 
-  $COMPOSE_CMD -f docker-compose-doris.yaml up -d
+  if [[ -n "$cluster_name" ]]; then
+    $COMPOSE_CMD -p "$cluster_name" -f "$compose_file" up -d
+  else
+    $COMPOSE_CMD -f "$compose_file" up -d
+  fi
 
   if [[ "$USE_CUSTOM_IMAGES" == "true" ]]; then
     echo "Doris cluster started successfully using custom images:"
@@ -515,8 +609,13 @@ else
   be1_ip="${SUBNET_BASE}.$((FE_NUM + 2))"
   echo "Cluster size: ${FE_NUM} FE(s), ${BE_NUM} BE(s)"
   echo "You can manage the cluster using the following commands:"
-  echo "  Stop cluster: ./start-doris.sh stop"
-  echo "  View logs: $COMPOSE_CMD -f docker-compose-doris.yaml logs -f"
+  if [[ -n "$cluster_name" ]]; then
+    echo "  Stop cluster: ./start-doris.sh stop -n ${cluster_name}"
+    echo "  View logs: $COMPOSE_CMD -p ${cluster_name} -f ${compose_file} logs -f"
+  else
+    echo "  Stop cluster: ./start-doris.sh stop"
+    echo "  View logs: $COMPOSE_CMD -f ${compose_file} logs -f"
+  fi
   echo "  Connect to FE (fe1): mysql -uroot -P9030 -h${fe1_ip}"
   echo "  FE Web UI: http://${fe1_ip}:8030"
   echo "  BE1 Web UI: http://${be1_ip}:8040"
